@@ -1,0 +1,115 @@
+# .github/workflows/dubai_weekly.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# Dubai Villa Watch — Email dominical automatique
+# Chaque dimanche à 08h00 heure de Dubaï (UTC+4) = 04h00 UTC
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Dubai Villa Watch — Rapport Dominical
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'      # Dimanche 04h00 UTC = 08h00 Dubaï
+
+  workflow_dispatch:           # Déclenchement manuel depuis l'UI GitHub
+    inputs:
+      dry_run:
+        description: 'Dry-run (génère HTML sans envoyer email)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  weekly-report:
+    name: Génération & Envoi rapport
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Code ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('dubai_agent/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r dubai_agent/requirements.txt
+          playwright install chromium --with-deps
+
+      # ── 3. Base de données (persistante entre les runs) ──────────────────
+      - name: Restore SQLite database
+        uses: actions/cache@v4
+        with:
+          path: dubai_agent/dubai_realestate.db
+          key:  db-${{ github.run_id }}
+          restore-keys: |
+            db-
+
+      # ── 4. Pipeline principal ─────────────────────────────────────────────
+      - name: Run weekly pipeline
+        working-directory: dubai_agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_HOST:         ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:         ${{ secrets.SMTP_PORT }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          TO_EMAIL:          ${{ secrets.TO_EMAIL }}
+          DASHBOARD_URL:     ${{ secrets.DASHBOARD_URL }}
+        run: |
+          DRY="${{ github.event.inputs.dry_run }}"
+          if [ "$DRY" = "true" ]; then
+            echo "Mode dry-run activé"
+            python main.py --dry-run
+          else
+            python main.py
+          fi
+
+      # ── 5. Sauvegardes ───────────────────────────────────────────────────
+      - name: Upload PDF report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-loyers-dubai-${{ github.run_id }}
+          path: dubai_agent/reports/*.pdf
+          retention-days: 90
+
+      - name: Upload email HTML preview (dry-run)
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-preview-${{ github.run_id }}
+          path: dubai_agent/reports/email_preview_*.html
+          retention-days: 7
+
+      # ── 6. Persistance DB ─────────────────────────────────────────────────
+      - name: Save updated database
+        uses: actions/cache@v4
+        with:
+          path: dubai_agent/dubai_realestate.db
+          key: db-${{ github.run_id }}
+
+      # ── 7. Notification en cas d'échec ────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `❌ Pipeline Dubai Watch échoué — ${new Date().toISOString().slice(0,10)}`,
+              body:  `Le pipeline hebdomadaire du dimanche a échoué.\n\nRun: ${context.runId}\nVoir les logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug', 'automated'],
+            })
