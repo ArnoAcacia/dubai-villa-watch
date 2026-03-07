@@ -381,6 +381,16 @@ def send_weekly_email(stats: dict, ai_analysis: str, pdf_path: Optional[str] = N
         except Exception as e:
             print(f"  ⚠️  PDF non attaché: {e}")
 
+    # Diagnostic avant envoi
+    print(f"  📧 SMTP {SMTP_HOST}:{SMTP_PORT}")
+    print(f"  📧 USER: {'OK' if SMTP_USER and SMTP_USER != 'votre@gmail.com' else '❌ NON DÉFINI'}")
+    print(f"  📧 PASS: {'OK' if SMTP_PASSWORD else '❌ NON DÉFINI'}")
+
+    if not SMTP_PASSWORD or not SMTP_USER or SMTP_USER == "votre@gmail.com":
+        print("  ❌ Secrets Gmail manquants — configurez SMTP_USER et SMTP_PASSWORD dans GitHub Secrets")
+        return False
+
+    # Essai 1 : SSL port 465
     try:
         ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as srv:
@@ -388,9 +398,22 @@ def send_weekly_email(stats: dict, ai_analysis: str, pdf_path: Optional[str] = N
             srv.sendmail(SMTP_USER, TO_EMAIL, msg.as_string())
         print(f"  ✅ Email envoyé → {TO_EMAIL}")
         return True
-    except Exception as e:
-        print(f"  ❌ Erreur SMTP: {e}")
+    except smtplib.SMTPAuthenticationError:
+        print("  ❌ Auth Gmail échouée — SMTP_PASSWORD doit être un App Password 16 caractères")
+        print("     Créez-en un : https://myaccount.google.com/apppasswords")
         return False
+    except Exception as e1:
+        print(f"  ⚠️  SSL 465 échoué: {e1} — tentative STARTTLS 587")
+        try:
+            with smtplib.SMTP(SMTP_HOST, 587) as srv:
+                srv.ehlo(); srv.starttls(context=ssl.create_default_context()); srv.ehlo()
+                srv.login(SMTP_USER, SMTP_PASSWORD)
+                srv.sendmail(SMTP_USER, TO_EMAIL, msg.as_string())
+            print(f"  ✅ Email envoyé (STARTTLS) → {TO_EMAIL}")
+            return True
+        except Exception as e2:
+            print(f"  ❌ SMTP SSL+STARTTLS échoués: {e1} | {e2}")
+            return False
 
 
 def preview_email_html(stats: dict, ai_analysis: str, output_path: str = "email_preview.html") -> str:
