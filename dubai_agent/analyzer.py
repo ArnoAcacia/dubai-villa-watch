@@ -1,124 +1,150 @@
 """
 dubai_agent/analyzer.py
-Analyse des données immobilières via Claude API
+Analyse des données locatives via Claude API
+Utilise la table rental_listings (et non l'ancienne table listings)
 """
 
 import sqlite3
 import json
-import anthropic
+import os
 from datetime import datetime
 
 DB_PATH = "dubai_realestate.db"
-client = anthropic.Anthropic()  # ANTHROPIC_API_KEY env var requis
+
 
 def get_weekly_stats() -> dict:
-    """Récupère les stats de la semaine en cours depuis la BDD."""
+    """Récupère les stats de la semaine depuis rental_listings."""
     conn = sqlite3.connect(DB_PATH)
 
-    # Stats globales
-    global_row = conn.execute("""
-        SELECT AVG(price_aed), AVG(price_per_sqft), COUNT(*)
-        FROM listings
+    # Vérifie que la table existe
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+
+    if "rental_listings" not in tables:
+        conn.close()
+        raise RuntimeError("no data yet — table rental_listings is empty or missing")
+
+    # Stats globales semaine courante
+    cur = conn.execute("""
+        SELECT AVG(rent_annual_aed), AVG(rent_per_sqft_annual), COUNT(*)
+        FROM rental_listings
         WHERE scraped_at >= date('now','-7 days')
     """).fetchone()
 
-    # Stats par district
-    district_rows = conn.execute("""
-        SELECT district,
-               AVG(price_aed) as avg_price,
-               AVG(price_per_sqft) as avg_ppsqft,
-               COUNT(*) as cnt
-        FROM listings
+    # Stats globales semaine précédente
+    prev = conn.execute("""
+        SELECT AVG(rent_annual_aed), AVG(rent_per_sqft_annual)
+        FROM rental_listings
+        WHERE scraped_at >= date('now','-14 days')
+          AND scraped_at <  date('now','-7 days')
+    """).fetchone()
+
+    # Par zone
+    zone_rows = conn.execute("""
+        SELECT zone,
+               AVG(rent_annual_aed),
+               AVG(rent_per_sqft_annual),
+               COUNT(*)
+        FROM rental_listings
         WHERE scraped_at >= date('now','-7 days')
-        GROUP BY district
-        ORDER BY avg_ppsqft DESC
+        GROUP BY zone
+        ORDER BY AVG(rent_annual_aed) DESC
     """).fetchall()
 
-    # Comparaison semaine précédente
-    prev_global = conn.execute("""
-        SELECT AVG(price_aed), AVG(price_per_sqft)
-        FROM listings
-        WHERE scraped_at >= date('now','-14 days')
-          AND scraped_at < date('now','-7 days')
-    """).fetchone()
+    # Par nb de chambres
+    beds_rows = conn.execute("""
+        SELECT bedrooms,
+               AVG(rent_annual_aed),
+               MIN(rent_annual_aed),
+               MAX(rent_annual_aed),
+               COUNT(*)
+        FROM rental_listings
+        WHERE scraped_at >= date('now','-7 days')
+        GROUP BY bedrooms
+        ORDER BY bedrooms
+    """).fetchall()
 
     conn.close()
 
-    stats = {
+    cur_avg  = cur[1] or 0
+    prev_avg = prev[0] if prev[0] else None
+    pct_chg  = round((cur_avg - prev_avg) / prev_avg * 100, 2) if prev_avg else None
+
+    return {
         "week": datetime.now().strftime("%Y-W%W"),
         "global": {
-            "avg_price_aed": round(global_row[0] or 0),
-            "avg_price_per_sqft": round(global_row[1] or 0, 1),
-            "total_listings": global_row[2],
+            "avg_rent_annual":     round(cur[0] or 0),
+            "avg_rent_per_sqft":   round(cur[1] or 0, 1),
+            "total_listings":      cur[2],
+            "price_change_pct":    pct_chg,
         },
         "prev_week": {
-            "avg_price_aed": round(prev_global[0] or 0) if prev_global[0] else None,
-            "avg_price_per_sqft": round(prev_global[1] or 0, 1) if prev_global[1] else None,
+            "avg_rent_annual":     round(prev[0]) if prev[0] else None,
+            "avg_rent_per_sqft":   round(prev[1], 1) if prev[1] else None,
         },
         "districts": [
             {
-                "name": r[0],
-                "avg_price_aed": round(r[1]),
-                "avg_ppsqft": round(r[2], 1),
-                "listings": r[3],
+                "name":        r[0],
+                "avg_rent":    round(r[1]),
+                "avg_ppsqft":  round(r[2] or 0, 1),
+                "listing_count": r[3],
             }
-            for r in district_rows
+            for r in zone_rows
+        ],
+        "by_beds": [
+            {
+                "bedrooms": r[0],
+                "avg_rent": round(r[1]),
+                "min_rent": r[2],
+                "max_rent": r[3],
+                "count":    r[4],
+            }
+            for r in beds_rows
         ],
     }
 
-    # Calcul de variation
-    if stats["prev_week"]["avg_price_aed"]:
-        pct = ((stats["global"]["avg_price_aed"] - stats["prev_week"]["avg_price_aed"])
-               / stats["prev_week"]["avg_price_aed"] * 100)
-        stats["global"]["price_change_pct"] = round(pct, 2)
-
-    return stats
-
 
 def analyze_with_claude(stats: dict) -> str:
-    """
-    Envoie les stats à Claude et récupère une analyse textuelle riche.
-    Retourne le texte de l'analyse.
-    """
-    prompt = f"""Tu es un analyste immobilier expert sur le marché de Dubaï.
+    """Envoie les stats à Claude et retourne l'analyse textuelle."""
+    import anthropic
+    client = anthropic.Anthropic()   # lit ANTHROPIC_API_KEY depuis l'env
 
-Voici les données collectées cette semaine sur le marché immobilier dubaiote :
+    prompt = f"""Tu es un analyste immobilier expert sur le marché locatif de Dubaï.
+
+Voici les données collectées cette semaine sur les LOYERS de villas 3-5BR
+dans les zones Jumeirah 1/2/3, Umm Suqeim 1/2, Al Safa 1/2, Al Manara, Al Wasl :
 
 {json.dumps(stats, indent=2, ensure_ascii=False)}
 
 Rédige une analyse hebdomadaire professionnelle en français comprenant :
-1. **Résumé exécutif** (2-3 phrases, chiffres clés)
-2. **Tendances par district** (quels quartiers montent, lesquels baissent, et pourquoi probablement)
-3. **Signaux d'alerte** (anomalies, risques à surveiller)
-4. **Opportunités d'investissement** identifiées cette semaine
-5. **Prévision courte terme** pour la semaine prochaine
+1. **Résumé exécutif** (2-3 phrases, chiffres clés de loyers annuels et mensuels)
+2. **Tendances par zone** (quels quartiers voient les loyers monter/baisser et pourquoi)
+3. **Signaux d'alerte** (anomalies, risques pour le marché locatif)
+4. **Opportunités locatives** identifiées cette semaine
+5. **Prévision** pour la semaine prochaine
 
-Format : markdown avec émojis pour les sections. Ton professionnel mais accessible.
-Longueur : 400-500 mots.
-"""
+Format : markdown avec émojis. Ton professionnel. Longueur : 350-450 mots.
+Exprimer les loyers toujours en AED/an ET en AED/mois."""
 
     message = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
-
     return message.content[0].text
 
 
 def run_analysis() -> tuple[dict, str]:
-    """Point d'entrée : récupère les stats, fait analyser par Claude, retourne les deux."""
     print("\n🤖 Analyse IA démarrée...")
-    stats = get_weekly_stats()
-    print(f"  Stats récupérées: {stats['global']['total_listings']} annonces cette semaine")
-
+    stats    = get_weekly_stats()
+    print(f"  Stats : {stats['global']['total_listings']} annonces cette semaine")
     analysis = analyze_with_claude(stats)
     print("  ✅ Analyse Claude générée")
-
     return stats, analysis
 
 
 if __name__ == "__main__":
     stats, analysis = run_analysis()
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(analysis)
