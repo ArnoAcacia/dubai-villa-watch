@@ -12,7 +12,7 @@ from typing import Optional
 
 DB_PATH      = "dubai_realestate.db"
 SMTP_HOST    = os.getenv("SMTP_HOST",    "smtp.gmail.com")
-SMTP_PORT    = int(os.getenv("SMTP_PORT", "465"))
+SMTP_PORT    = int(os.getenv("SMTP_PORT") or "465")   # défaut 465 si secret vide ou absent
 SMTP_USER    = os.getenv("SMTP_USER",    "votre@gmail.com")
 SMTP_PASSWORD= os.getenv("SMTP_PASSWORD","")
 TO_EMAIL     = os.getenv("TO_EMAIL",     "destinataire@email.com")
