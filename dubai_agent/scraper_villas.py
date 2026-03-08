@@ -1,115 +1,92 @@
 """
 dubai_agent/scraper_villas.py
-Scraping ciblé : LOYERS de villas 3-5BR
-Jumeirah 1/2/3, Umm Suqeim 1/2, Al Safa 1/2, Al Manara, Al Wasl
-Toutes les valeurs sont converties en LOYER ANNUEL AED pour permettre les comparaisons.
+Collecte les loyers via "Unofficial Bayut API" (API Universe) sur RapidAPI
+Endpoint: https://unofficial-bayut-api.p.rapidapi.com/search
 """
 
-import asyncio
-import sqlite3
-import re
+import sqlite3, os, json, time
+import urllib.request, urllib.parse
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
-from playwright.async_api import async_playwright, Page
 
-DB_PATH = "dubai_realestate.db"
+DB_PATH      = "dubai_realestate.db"
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+API_HOST     = "unofficial-bayut-api.p.rapidapi.com"
+BASE_URL     = f"https://{API_HOST}"
 
-# ── Zones cibles ──────────────────────────────────────────────────────────────
-TARGET_ZONES = {
-    "Jumeirah 1":     ["jumeirah 1", "jumeirah1", "jumeirah - 1"],
-    "Jumeirah 2":     ["jumeirah 2", "jumeirah2", "jumeirah - 2"],
-    "Jumeirah 3":     ["jumeirah 3", "jumeirah3", "jumeirah - 3"],
-    "Umm Suqeim 1":   ["umm suqeim 1", "umm suqueim 1", "umm suqeim1"],
-    "Umm Suqeim 2":   ["umm suqeim 2", "umm suqueim 2", "umm suqeim2"],
-    "Al Safa 1":      ["al safa 1", "alsafa 1", "al safa1"],
-    "Al Safa 2":      ["al safa 2", "alsafa 2", "al safa2"],
-    "Al Manara":      ["al manara", "manara"],
-    "Al Wasl":        ["al wasl", "alwasl"],
-    "Al Quoz 1":      ["al quoz 1"],
-    "Madinat Jumeirah": ["madinat jumeirah", "madinat"],
-}
-
-# URLs LOCATION (to-rent) villas 3-5BR
-BAYUT_URLS = [
-    "https://www.bayut.com/to-rent/villas/dubai/jumeirah/jumeirah-1/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/jumeirah/jumeirah-2/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/jumeirah/jumeirah-3/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/umm-suqeim/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/al-safa/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/al-manara/?beds=3,4,5",
-    "https://www.bayut.com/to-rent/villas/dubai/al-wasl/?beds=3,4,5",
+# ── Zones cibles avec leurs IDs Bayut ────────────────────────────────────────
+# Ces IDs sont obtenus via l'endpoint /autocomplete
+# On les récupère dynamiquement au premier lancement, puis on les met en cache
+ZONE_NAMES = [
+    "Jumeirah 1",
+    "Jumeirah 2",
+    "Jumeirah 3",
+    "Umm Suqeim 1",
+    "Umm Suqeim 2",
+    "Al Safa 1",
+    "Al Safa 2",
+    "Al Manara",
+    "Al Wasl",
 ]
 
-PROPERTYFINDER_URLS = [
-    "https://www.propertyfinder.ae/en/search?l=2&c=2&t=4&ob=mr&bdr=3&nbds=5&ne=jumeirah-1",
-    "https://www.propertyfinder.ae/en/search?l=2&c=2&t=4&ob=mr&bdr=3&nbds=5&ne=jumeirah-2",
-    "https://www.propertyfinder.ae/en/search?l=2&c=2&t=4&ob=mr&bdr=3&nbds=5&ne=jumeirah-3",
-    "https://www.propertyfinder.ae/en/search?l=2&c=2&t=4&ob=mr&bdr=3&nbds=5&ne=umm-suqeim",
-    "https://www.propertyfinder.ae/en/search?l=2&c=2&t=4&ob=mr&bdr=3&nbds=5&ne=al-safa",
-]
 
-# ── Dataclass ─────────────────────────────────────────────────────────────────
 @dataclass
 class RentalListing:
-    source: str
-    title: str
-    zone: str
-    district_raw: str
-    rent_annual_aed: int          # Loyer ANNUEL AED (normalisé — valeur de référence)
-    rent_monthly_aed: int         # rent_annual / 12
-    sqft: Optional[int]
-    rent_per_sqft_annual: Optional[float]   # AED/sqft/an
-    bedrooms: int
-    bathrooms: Optional[int]
-    cheques: Optional[int]        # Nb de chèques (1=annuel, 4=trimestriel, 12=mensuel)
-    furnished: Optional[bool]
-    url: str
-    scraped_at: str
-    listing_age_days: Optional[int]
+    source:               str
+    title:                str
+    zone:                 str
+    district_raw:         str
+    rent_annual_aed:      int
+    rent_monthly_aed:     int
+    sqft:                 Optional[int]
+    rent_per_sqft_annual: Optional[float]
+    bedrooms:             int
+    bathrooms:            Optional[int]
+    cheques:              Optional[int]
+    furnished:            Optional[bool]
+    url:                  str
+    scraped_at:           str
+    listing_age_days:     Optional[int]
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS rental_listings (
-            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            source                TEXT,
-            title                 TEXT,
-            zone                  TEXT,
-            district_raw          TEXT,
-            rent_annual_aed       INTEGER,
-            rent_monthly_aed      INTEGER,
-            sqft                  INTEGER,
-            rent_per_sqft_annual  REAL,
-            bedrooms              INTEGER,
-            bathrooms             INTEGER,
-            cheques               INTEGER,
-            furnished             INTEGER,
-            url                   TEXT UNIQUE,
-            scraped_at            TEXT,
-            listing_age_days      INTEGER
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT, title TEXT, zone TEXT, district_raw TEXT,
+            rent_annual_aed INTEGER, rent_monthly_aed INTEGER,
+            sqft INTEGER, rent_per_sqft_annual REAL,
+            bedrooms INTEGER, bathrooms INTEGER,
+            cheques INTEGER, furnished INTEGER,
+            url TEXT UNIQUE, scraped_at TEXT, listing_age_days INTEGER
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS rental_weekly_snapshots (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_date        TEXT,
-            zone             TEXT,
-            bedrooms         INTEGER,
-            avg_rent_annual  REAL,
-            med_rent_annual  REAL,
-            min_rent_annual  INTEGER,
-            max_rent_annual  INTEGER,
-            avg_rent_sqft    REAL,
-            listing_count    INTEGER,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_date TEXT, zone TEXT, bedrooms INTEGER,
+            avg_rent_annual REAL, med_rent_annual REAL,
+            min_rent_annual INTEGER, max_rent_annual INTEGER,
+            avg_rent_sqft REAL, listing_count INTEGER,
             UNIQUE(week_date, zone, bedrooms)
+        )
+    """)
+    # Cache des IDs de zones
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS zone_ids (
+            zone_name TEXT PRIMARY KEY,
+            external_id TEXT,
+            updated_at TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-def save_listings(listings: list[RentalListing]) -> int:
+
+def save_listings(listings):
     conn = sqlite3.connect(DB_PATH)
     inserted = 0
     for l in listings:
@@ -122,8 +99,9 @@ def save_listings(listings: list[RentalListing]) -> int:
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (l.source, l.title, l.zone, l.district_raw,
                   l.rent_annual_aed, l.rent_monthly_aed,
-                  l.sqft, l.rent_per_sqft_annual,
-                  l.bedrooms, l.bathrooms, l.cheques, l.furnished,
+                  l.sqft, l.rent_per_sqft_annual, l.bedrooms,
+                  l.bathrooms, l.cheques,
+                  int(l.furnished) if l.furnished is not None else None,
                   l.url, l.scraped_at, l.listing_age_days))
             inserted += 1
         except Exception:
@@ -132,13 +110,14 @@ def save_listings(listings: list[RentalListing]) -> int:
     conn.close()
     return inserted
 
+
 def save_weekly_snapshot():
     conn = sqlite3.connect(DB_PATH)
     week = datetime.now().strftime("%Y-W%W")
     rows = conn.execute("""
         SELECT zone, bedrooms,
-               AVG(rent_annual_aed), MIN(rent_annual_aed), MAX(rent_annual_aed),
-               AVG(rent_per_sqft_annual), COUNT(*)
+               AVG(rent_annual_aed), MIN(rent_annual_aed),
+               MAX(rent_annual_aed), AVG(rent_per_sqft_annual), COUNT(*)
         FROM rental_listings
         WHERE scraped_at >= date('now','-7 days')
         GROUP BY zone, bedrooms
@@ -146,251 +125,223 @@ def save_weekly_snapshot():
     for r in rows:
         conn.execute("""
             INSERT OR REPLACE INTO rental_weekly_snapshots
-            (week_date,zone,bedrooms,avg_rent_annual,min_rent_annual,max_rent_annual,avg_rent_sqft,listing_count)
+            (week_date,zone,bedrooms,avg_rent_annual,min_rent_annual,
+             max_rent_annual,avg_rent_sqft,listing_count)
             VALUES (?,?,?,?,?,?,?,?)
-        """, (week, r[0], r[1], round(r[2]), r[3], r[4], round(r[5] or 0, 1), r[6]))
+        """, (week, r[0], r[1], round(r[2]), r[3], r[4],
+              round(r[5] or 0, 1), r[6]))
     conn.commit()
     conn.close()
-    print(f"  [DB] Snapshot loyers {week}: {len(rows)} combinaisons zone×chambres")
+    print(f"  [DB] Snapshot {week}: {len(rows)} combinaisons zone×chambres")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def normalize_rent_to_annual(amount: int, text_context: str) -> int:
-    """
-    Les annonces à Dubaï affichent parfois le loyer mensuel ou trimestriel.
-    Règle empirique :
-      - Si > 500 000 → probablement annuel (loyer villa annuel max ~800K AED)
-      - Si 20 000 – 120 000 → probablement mensuel → x12
-      - Sinon → on garde tel quel (annuel)
-    """
-    ctx = text_context.lower()
-    if "per month" in ctx or "/month" in ctx or "monthly" in ctx:
-        return amount * 12
-    if "per year" in ctx or "/year" in ctx or "yearly" in ctx or "annual" in ctx or "p.a" in ctx:
-        return amount
-    # Heuristique sur la valeur
-    if 10_000 <= amount <= 150_000:
-        return amount * 12   # probablement mensuel
-    return amount            # probablement annuel
 
-def clean_amount(txt: str) -> Optional[int]:
-    digits = re.sub(r"[^\d]", "", txt or "")
-    return int(digits) if digits else None
+# ── API helpers ───────────────────────────────────────────────────────────────
+def api_get(endpoint: str, params: dict) -> dict:
+    qs  = urllib.parse.urlencode(params)
+    url = f"{BASE_URL}/{endpoint}?{qs}"
+    req = urllib.request.Request(url, headers={
+        "X-RapidAPI-Key":  RAPIDAPI_KEY,
+        "X-RapidAPI-Host": API_HOST,
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
 
-def clean_sqft(txt: str) -> Optional[int]:
-    m = re.search(r"([\d,]+)\s*(?:sqft|sq\.ft|ft²|sqm)", txt or "", re.I)
-    if m:
-        val = int(m.group(1).replace(",", ""))
-        if "sqm" in txt.lower():
-            val = int(val * 10.764)
-        return val
-    return None
 
-def extract_bedrooms(txt: str) -> Optional[int]:
-    m = re.search(r"(\d)\s*(?:bed|br|bedroom)", txt or "", re.I)
-    if m:
-        n = int(m.group(1))
-        return n if 3 <= n <= 5 else None
-    return None
+def get_location_id(zone_name: str) -> Optional[str]:
+    """Appelle /autocomplete pour obtenir l'ID numérique d'une zone."""
+    # Vérifier le cache DB d'abord
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT external_id FROM zone_ids WHERE zone_name=?", (zone_name,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return row[0]
 
-def extract_cheques(txt: str) -> Optional[int]:
-    m = re.search(r"(\d+)\s*cheque", txt or "", re.I)
-    return int(m.group(1)) if m else None
+    # Appel API autocomplete
+    try:
+        data = api_get("autocomplete", {"query": zone_name, "lang": "en"})
+        # Chercher dans la réponse — structure typique : hits ou results
+        hits = (data.get("hits") or data.get("results") or
+                data.get("locationHierarchy") or [])
 
-def is_furnished(txt: str) -> Optional[bool]:
-    txt = (txt or "").lower()
-    if "furnished" in txt and "unfurnished" not in txt:
-        return True
-    if "unfurnished" in txt:
-        return False
-    return None
+        # Chercher le meilleur match (type "area" ou "community")
+        best_id = None
+        for hit in hits:
+            hit_type = str(hit.get("type", "")).lower()
+            hit_name = str(hit.get("name", "") or
+                           hit.get("externalID", "")).lower()
+            ext_id   = str(hit.get("externalID") or hit.get("id") or "")
 
-def normalize_zone(location_text: str) -> Optional[str]:
-    lt = location_text.lower()
-    for zone, variants in TARGET_ZONES.items():
-        if any(v in lt for v in variants):
-            return zone
-    return None
+            if ext_id and zone_name.lower() in hit_name:
+                best_id = ext_id
+                if hit_type in ("area", "community", "subCommunity"):
+                    break   # match parfait
 
-# ── Scrapers ──────────────────────────────────────────────────────────────────
-async def scrape_bayut(page: Page) -> list[RentalListing]:
-    results = []
-    for url in BAYUT_URLS:
-        zone_hint = url.split("/")[-2].replace("-", " ").title()
-        print(f"    → Bayut {zone_hint}")
-        try:
-            await page.goto(url, timeout=45000, wait_until="networkidle")
-            await page.wait_for_timeout(2500)
-            cards = await page.query_selector_all(
-                "[class*='property-card'], [data-testid='listing-card'], article"
-            )
-            for card in cards[:40]:
-                try:
-                    title_el = await card.query_selector("[class*='title'], h2, h3")
-                    price_el = await card.query_selector("[class*='price']")
-                    loc_el   = await card.query_selector("[class*='location'], [class*='address']")
-                    area_el  = await card.query_selector("[aria-label*='sqft'], [class*='area']")
-                    beds_el  = await card.query_selector("[aria-label*='bed'], [class*='bed']")
-                    baths_el = await card.query_selector("[aria-label*='bath'], [class*='bath']")
-                    link_el  = await card.query_selector("a[href]")
-                    full_txt = (await card.inner_text()).lower()
+        if best_id:
+            # Sauvegarder en cache
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("""
+                INSERT OR REPLACE INTO zone_ids (zone_name, external_id, updated_at)
+                VALUES (?,?,?)
+            """, (zone_name, best_id, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            print(f"     📍 {zone_name} → ID {best_id}")
+            return best_id
+        else:
+            print(f"     ⚠️  ID introuvable pour {zone_name}")
+            return None
+    except Exception as e:
+        print(f"     ⚠️  Autocomplete échoué pour {zone_name}: {e}")
+        return None
 
-                    title_txt = (await title_el.inner_text()).strip() if title_el else ""
-                    price_txt = (await price_el.inner_text()).strip() if price_el else ""
-                    loc_txt   = (await loc_el.inner_text()).strip()   if loc_el   else ""
-                    area_txt  = (await area_el.inner_text()).strip()  if area_el  else ""
-                    beds_txt  = (await beds_el.inner_text()).strip()  if beds_el  else ""
-                    baths_txt = (await baths_el.inner_text()).strip() if baths_el else ""
-                    href      = await link_el.get_attribute("href")   if link_el  else ""
 
-                    raw_amt = clean_amount(price_txt)
-                    sqft    = clean_sqft(area_txt)
-                    beds    = extract_bedrooms(beds_txt) or extract_bedrooms(title_txt)
-                    zone    = normalize_zone(loc_txt) or normalize_zone(title_txt)
+def fetch_rentals(location_id: str, rooms: str, page: int = 0) -> list:
+    """Appelle /search avec les bons paramètres."""
+    try:
+        data = api_get("search", {
+            "locationExternalIDs": location_id,
+            "purpose":   "for-rent",
+            "categories": "residential",   # villas incluses
+            "rooms":      rooms,           # ex: "3" ou "3,4,5"
+            "rentFreq":   "yearly",        # loyer annuel directement
+            "page":       str(page),
+        })
+        return (data.get("hits") or data.get("results") or
+                data.get("properties") or data.get("data") or [])
+    except Exception as e:
+        print(f"       API error: {e}")
+        return []
 
-                    if not raw_amt or not zone or not beds:
-                        continue
 
-                    annual = normalize_rent_to_annual(raw_amt, full_txt)
-                    # Sanity check : loyer annuel villa Dubai 3-5BR entre 100K et 900K AED
-                    if not (100_000 <= annual <= 900_000):
-                        continue
+def parse_hit(hit: dict, zone_label: str) -> Optional[RentalListing]:
+    """Parse un résultat API → RentalListing."""
+    try:
+        # Prix annuel (rentFreq=yearly → directement annuel)
+        price = (hit.get("price") or hit.get("rentPrice") or
+                 hit.get("annualRent") or 0)
+        if isinstance(price, str):
+            price = int("".join(c for c in price if c.isdigit()) or "0")
+        annual = int(price)
 
-                    results.append(RentalListing(
-                        source="Bayut",
-                        title=title_txt[:140],
-                        zone=zone,
-                        district_raw=loc_txt[:100],
-                        rent_annual_aed=annual,
-                        rent_monthly_aed=annual // 12,
-                        sqft=sqft,
-                        rent_per_sqft_annual=round(annual / sqft, 1) if sqft else None,
-                        bedrooms=beds,
-                        bathrooms=clean_amount(baths_txt),
-                        cheques=extract_cheques(full_txt),
-                        furnished=is_furnished(full_txt),
-                        url=f"https://www.bayut.com{href}" if href.startswith("/") else href,
-                        scraped_at=datetime.now().isoformat(),
-                        listing_age_days=None,
-                    ))
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"    ❌ Erreur Bayut {zone_hint}: {e}")
-    return results
+        # Sanity check loyer annuel villa Dubai
+        if not (80_000 <= annual <= 1_500_000):
+            return None
 
-async def scrape_propertyfinder(page: Page) -> list[RentalListing]:
-    results = []
-    for url in PROPERTYFINDER_URLS:
-        zone_hint = url.split("ne=")[-1] if "ne=" in url else "?"
-        print(f"    → PropertyFinder {zone_hint}")
-        try:
-            await page.goto(url, timeout=45000, wait_until="networkidle")
-            await page.wait_for_timeout(2500)
-            cards = await page.query_selector_all(
-                "[class*='card'], article, [data-testid*='property']"
-            )
-            for card in cards[:40]:
-                try:
-                    price_el = await card.query_selector("[class*='price']")
-                    title_el = await card.query_selector("h2, h3, [class*='title']")
-                    loc_el   = await card.query_selector("[class*='location']")
-                    area_el  = await card.query_selector("[class*='area']")
-                    beds_el  = await card.query_selector("[class*='bed']")
-                    link_el  = await card.query_selector("a[href]")
-                    full_txt = (await card.inner_text()).lower()
+        # Chambres
+        beds = int(hit.get("rooms") or hit.get("beds") or
+                   hit.get("bedrooms") or 0)
+        if beds not in (3, 4, 5):
+            return None
 
-                    price_txt = (await price_el.inner_text()) if price_el else ""
-                    title_txt = (await title_el.inner_text()) if title_el else ""
-                    loc_txt   = (await loc_el.inner_text())   if loc_el   else ""
-                    area_txt  = (await area_el.inner_text())  if area_el  else ""
-                    beds_txt  = (await beds_el.inner_text())  if beds_el  else ""
-                    href      = await link_el.get_attribute("href") if link_el else ""
+        # Surface sqft
+        area = hit.get("area") or hit.get("size")
+        sqft = int(float(area)) if area else None
 
-                    raw_amt = clean_amount(price_txt)
-                    sqft    = clean_sqft(area_txt)
-                    beds    = extract_bedrooms(beds_txt) or extract_bedrooms(title_txt)
-                    zone    = normalize_zone(loc_txt) or normalize_zone(title_txt)
+        # URL
+        ext_id = str(hit.get("externalID") or hit.get("id") or "")
+        url    = (hit.get("url") or hit.get("link") or
+                  f"https://www.bayut.com/property/details-{ext_id}.html")
 
-                    if not raw_amt or not zone or not beds:
-                        continue
+        # Titre
+        title_raw = hit.get("title") or hit.get("name") or {}
+        if isinstance(title_raw, dict):
+            title = title_raw.get("en") or next(iter(title_raw.values()), "Villa")
+        else:
+            title = str(title_raw) or "Villa"
 
-                    annual = normalize_rent_to_annual(raw_amt, full_txt)
-                    if not (100_000 <= annual <= 900_000):
-                        continue
+        # Localisation brute
+        loc = hit.get("location") or hit.get("locationHierarchy") or []
+        district_raw = (loc[-1].get("name", zone_label)
+                        if isinstance(loc, list) and loc else zone_label)
 
-                    results.append(RentalListing(
-                        source="PropertyFinder",
-                        title=title_txt[:140].strip(),
-                        zone=zone,
-                        district_raw=loc_txt[:100],
-                        rent_annual_aed=annual,
-                        rent_monthly_aed=annual // 12,
-                        sqft=sqft,
-                        rent_per_sqft_annual=round(annual / sqft, 1) if sqft else None,
-                        bedrooms=beds,
-                        bathrooms=None,
-                        cheques=extract_cheques(full_txt),
-                        furnished=is_furnished(full_txt),
-                        url=f"https://www.propertyfinder.ae{href}" if href.startswith("/") else href,
-                        scraped_at=datetime.now().isoformat(),
-                        listing_age_days=None,
-                    ))
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"    ❌ Erreur PF: {e}")
-    return results
+        # Meublé
+        furn = str(hit.get("furnishingStatus") or hit.get("furnished") or "").lower()
+        furnished = (True  if "furnished" in furn and "un" not in furn else
+                     False if "unfurnish" in furn else None)
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-async def run_villa_scraping() -> list[RentalListing]:
-    print("\n🏡 Scraping LOYERS villas 3-5BR — Jumeirah / Umm Suqeim / Al Safa")
+        return RentalListing(
+            source="Unofficial Bayut API",
+            title=str(title)[:140],
+            zone=zone_label,
+            district_raw=str(district_raw)[:100],
+            rent_annual_aed=annual,
+            rent_monthly_aed=annual // 12,
+            sqft=sqft,
+            rent_per_sqft_annual=round(annual / sqft, 1) if sqft else None,
+            bedrooms=beds,
+            bathrooms=hit.get("baths") or hit.get("bathrooms"),
+            cheques=None,
+            furnished=furnished,
+            url=str(url),
+            scraped_at=datetime.now().isoformat(),
+            listing_age_days=None,
+        )
+    except Exception:
+        return None
+
+
+# ── Pipeline principal ────────────────────────────────────────────────────────
+async def run_villa_scraping():
+    print("\n🏡 Scraping LOYERS villas 3-5BR — Unofficial Bayut API")
     init_db()
-    all_listings: list[RentalListing] = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
-        )
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1440, "height": 900},
-            locale="en-AE",
-            timezone_id="Asia/Dubai",
-        )
-        page = await ctx.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+    if not RAPIDAPI_KEY:
+        print("  ❌ RAPIDAPI_KEY manquant — ajoutez ce secret dans GitHub")
+        return []
 
-        print("\n  📡 Bayut.com — Villas à louer...")
-        bayut = await scrape_bayut(page)
-        all_listings.extend(bayut)
-        print(f"  ✅ Bayut: {len(bayut)} annonces de location")
+    all_listings = []
 
-        print("\n  📡 PropertyFinder.ae — Villas à louer...")
-        pf = await scrape_propertyfinder(page)
-        all_listings.extend(pf)
-        print(f"  ✅ PropertyFinder: {len(pf)} annonces de location")
+    for zone_name in ZONE_NAMES:
+        print(f"\n  📍 {zone_name}")
 
-        await browser.close()
+        # Étape 1 : obtenir l'ID de la zone
+        loc_id = get_location_id(zone_name)
+        if not loc_id:
+            print(f"     ⏭️  Zone ignorée (ID introuvable)")
+            continue
 
+        time.sleep(0.3)
+
+        # Étape 2 : scraper 3BR, 4BR, 5BR séparément
+        for beds in (3, 4, 5):
+            try:
+                hits  = fetch_rentals(loc_id, str(beds))
+                count = 0
+                for hit in hits:
+                    listing = parse_hit(hit, zone_name)
+                    if listing:
+                        all_listings.append(listing)
+                        count += 1
+                print(f"     {beds}BR : {count}/{len(hits)} annonces valides")
+                time.sleep(0.4)   # respecter le rate limit
+            except Exception as e:
+                print(f"     {beds}BR : erreur ({e})")
+
+    # Sauvegarde
     n_saved = save_listings(all_listings)
     save_weekly_snapshot()
 
-    # Résumé par zone
+    # Résumé
     by_zone: dict[str, list] = {}
     for l in all_listings:
         by_zone.setdefault(l.zone, []).append(l)
-    print(f"\n  📊 Loyers annuels par zone:")
-    for zone, lst in sorted(by_zone.items()):
-        rents = [l.rent_annual_aed for l in lst]
-        print(f"     {zone:<18} {len(lst):>3} annonces  "
-              f"moy AED {sum(rents)//len(rents):>9,}/an")
+
+    if by_zone:
+        print(f"\n  📊 Loyers annuels par zone :")
+        for zone, lst in sorted(by_zone.items()):
+            rents = [l.rent_annual_aed for l in lst]
+            avg   = sum(rents) // len(rents)
+            print(f"     {zone:<18} {len(lst):>3} annonces  "
+                  f"moy AED {avg:>9,}/an  ({avg//12:,}/mois)")
+    else:
+        print("\n  ⚠️  Aucune annonce collectée")
+
     print(f"\n  💾 {n_saved}/{len(all_listings)} nouvelles annonces sauvegardées")
     return all_listings
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(run_villa_scraping())
