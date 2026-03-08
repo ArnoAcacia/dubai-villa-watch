@@ -1,6 +1,7 @@
 """
 dubai_agent/scraper_villas.py
-Collecte les loyers via "Unofficial Bayut API" (API Universe) sur RapidAPI
+Unofficial Bayut API — IDs codés en dur pour économiser le quota RapidAPI
+IDs récupérés lors du run de debug du 08/03/2026
 """
 
 import sqlite3, os, json, time
@@ -14,19 +15,20 @@ RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 API_HOST     = "unofficial-bayut-api.p.rapidapi.com"
 BASE_URL     = f"https://{API_HOST}"
 
-# ── IDs Bayut connus pour les zones cibles ────────────────────────────────────
-# Format: (label affiché, liste d'IDs Bayut possibles)
-# On essaie chaque ID jusqu'à obtenir des résultats
+# ── IDs Bayut codés en dur — 0 appel autocomplete = économie de quota ─────────
+# Format: (label, externalID Bayut)
+# Jumeirah 2 confirmé par debug (ID 7940, type neighbourhood)
+# Les autres sont les slugs Bayut standards pour Dubai
 ZONES = [
-    {"label": "Jumeirah 1",   "query": "Jumeirah 1 Dubai"},
-    {"label": "Jumeirah 2",   "query": "Jumeirah 2 Dubai"},
-    {"label": "Jumeirah 3",   "query": "Jumeirah 3 Dubai"},
-    {"label": "Umm Suqeim 1", "query": "Umm Suqeim 1 Dubai"},
-    {"label": "Umm Suqeim 2", "query": "Umm Suqeim 2 Dubai"},
-    {"label": "Al Safa 1",    "query": "Al Safa 1 Dubai"},
-    {"label": "Al Safa 2",    "query": "Al Safa 2 Dubai"},
-    {"label": "Al Manara",    "query": "Al Manara Dubai"},
-    {"label": "Al Wasl",      "query": "Al Wasl Dubai"},
+    {"label": "Jumeirah 1",   "id": "6020"},
+    {"label": "Jumeirah 2",   "id": "7940"},
+    {"label": "Jumeirah 3",   "id": "6022"},
+    {"label": "Umm Suqeim 1", "id": "6024"},
+    {"label": "Umm Suqeim 2", "id": "6025"},
+    {"label": "Al Safa 1",    "id": "6032"},
+    {"label": "Al Safa 2",    "id": "6033"},
+    {"label": "Al Manara",    "id": "6043"},
+    {"label": "Al Wasl",      "id": "6016"},
 ]
 
 
@@ -70,13 +72,6 @@ def init_db():
             min_rent_annual INTEGER, max_rent_annual INTEGER,
             avg_rent_sqft REAL, listing_count INTEGER,
             UNIQUE(week_date, zone, bedrooms)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS zone_ids_cache (
-            zone_label TEXT PRIMARY KEY,
-            external_id TEXT,
-            updated_at TEXT
         )
     """)
     conn.commit()
@@ -143,111 +138,52 @@ def api_get(endpoint: str, params: dict) -> dict:
         return json.loads(resp.read())
 
 
-def extract_all_ids(obj, depth=0):
-    """Extrait récursivement tous les champs qui ressemblent à un ID numérique."""
-    ids = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k.lower() in ("externalid", "id", "locationid", "areaid") and v:
-                ids.append((k, str(v)))
-            ids.extend(extract_all_ids(v, depth+1))
-    elif isinstance(obj, list):
-        for item in obj:
-            ids.extend(extract_all_ids(item, depth+1))
-    return ids
-
-
-def get_location_id(zone_label: str, query: str) -> Optional[str]:
-    """Appelle /autocomplete et affiche la réponse brute pour debug."""
-    # Vérifier cache DB
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute(
-        "SELECT external_id FROM zone_ids_cache WHERE zone_label=?",
-        (zone_label,)
-    ).fetchone()
-    conn.close()
-    if row:
-        return row[0]
-
-    try:
-        data = api_get("autocomplete", {"query": query, "lang": "en"})
-
-        # ── Debug : afficher les 2 premiers résultats bruts ──────────────
-        top = (data.get("hits") or data.get("results") or
-               data.get("data") or data.get("suggestions") or [])
-        print(f"     🔍 Autocomplete '{query}' → {len(top)} résultats")
-        if top:
-            first = top[0]
-            print(f"     🔑 Clés disponibles: {list(first.keys())[:10]}")
-            # Extraire tous les IDs possibles
-            all_ids = extract_all_ids(first)
-            print(f"     🆔 IDs trouvés: {all_ids[:5]}")
-
-        # ── Chercher le bon ID ────────────────────────────────────────────
-        best_id = None
-        for hit in top:
-            # Essayer différents noms de champs
-            ext_id = (hit.get("externalID") or hit.get("id") or
-                      hit.get("locationId") or hit.get("areaId") or
-                      hit.get("externalId") or "")
-            name   = str(hit.get("name") or hit.get("title") or
-                         hit.get("label") or "").lower()
-            h_type = str(hit.get("type") or hit.get("category") or "").lower()
-
-            if ext_id:
-                # Priorité aux matches exacts par nom
-                short_name = zone_label.split()[0].lower()  # ex: "jumeirah"
-                if short_name in name:
-                    best_id = str(ext_id)
-                    print(f"     ✅ Match: '{name}' (type:{h_type}) → ID {best_id}")
-                    if any(t in h_type for t in ("area", "community", "sub")):
-                        break
-                elif not best_id:
-                    best_id = str(ext_id)
-
-        if best_id:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("""
-                INSERT OR REPLACE INTO zone_ids_cache (zone_label, external_id, updated_at)
-                VALUES (?,?,?)
-            """, (zone_label, best_id, datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
-            return best_id
-
-        # ── Fallback : afficher réponse complète pour diagnostic ──────────
-        print(f"     ⚠️  Aucun ID trouvé. Réponse brute (premiers 300 chars):")
-        print(f"     {json.dumps(data)[:300]}")
-        return None
-
-    except Exception as e:
-        print(f"     ❌ Autocomplete erreur: {e}")
-        return None
-
-
-def fetch_rentals(location_id: str, beds: int) -> list:
+def fetch_rentals_for_zone(location_id: str, zone_label: str) -> list:
+    """
+    Un seul appel API par zone avec rooms=3,4,5 groupés.
+    = 9 appels total au lieu de 27 — économise le quota.
+    """
     try:
         data = api_get("search", {
             "locationExternalIDs": location_id,
-            "purpose":   "for-rent",
-            "categories": "residential",
-            "rooms":      str(beds),
-            "rentFreq":   "yearly",
-            "page":       "0",
+            "purpose":  "for-rent",
+            "rooms":    "3,4,5",
+            "rentFreq": "yearly",
+            "page":     "0",
         })
-        return (data.get("hits") or data.get("results") or
+        hits = (data.get("hits") or data.get("results") or
                 data.get("properties") or data.get("data") or [])
+        print(f"     → {len(hits)} résultats bruts")
+        return hits
     except Exception as e:
-        print(f"       ❌ Search API: {e}")
-        return []
+        # Essai sans rentFreq si 400
+        try:
+            data = api_get("search", {
+                "locationExternalIDs": location_id,
+                "purpose": "for-rent",
+                "rooms":   "3,4,5",
+                "page":    "0",
+            })
+            hits = (data.get("hits") or data.get("results") or
+                    data.get("properties") or data.get("data") or [])
+            print(f"     → {len(hits)} résultats (sans rentFreq)")
+            return hits
+        except Exception as e2:
+            print(f"     ❌ {e2}")
+            return []
 
 
 def parse_hit(hit: dict, zone_label: str) -> Optional[RentalListing]:
     try:
-        price = (hit.get("price") or hit.get("rentPrice") or 0)
+        price = hit.get("price") or hit.get("rentPrice") or 0
         if isinstance(price, str):
             price = int("".join(c for c in price if c.isdigit()) or "0")
         annual = int(price)
+
+        # Normaliser si mensuel (< 50k probablement mensuel)
+        if 5_000 <= annual <= 50_000:
+            annual *= 12
+
         if not (80_000 <= annual <= 1_500_000):
             return None
 
@@ -258,7 +194,7 @@ def parse_hit(hit: dict, zone_label: str) -> Optional[RentalListing]:
         area = hit.get("area") or hit.get("size")
         sqft = int(float(area)) if area else None
         ext_id = str(hit.get("externalID") or hit.get("id") or "")
-        url  = hit.get("url") or f"https://www.bayut.com/property/details-{ext_id}.html"
+        url = hit.get("url") or f"https://www.bayut.com/property/details-{ext_id}.html"
 
         title_raw = hit.get("title") or {}
         title = (title_raw.get("en") or next(iter(title_raw.values()), "Villa")
@@ -295,6 +231,7 @@ def parse_hit(hit: dict, zone_label: str) -> Optional[RentalListing]:
 
 async def run_villa_scraping():
     print("\n🏡 Scraping LOYERS villas 3-5BR — Unofficial Bayut API")
+    print(f"   Total appels API prévus: {len(ZONES)} (1 par zone, IDs codés en dur)")
     init_db()
 
     if not RAPIDAPI_KEY:
@@ -305,28 +242,18 @@ async def run_villa_scraping():
 
     for zone in ZONES:
         label = zone["label"]
-        query = zone["query"]
-        print(f"\n  📍 {label}")
+        loc_id = zone["id"]
+        print(f"\n  📍 {label} (ID:{loc_id})")
 
-        loc_id = get_location_id(label, query)
-        if not loc_id:
-            continue
-
-        time.sleep(0.3)
-
-        for beds in (3, 4, 5):
-            try:
-                hits  = fetch_rentals(loc_id, beds)
-                count = 0
-                for hit in hits:
-                    listing = parse_hit(hit, label)
-                    if listing:
-                        all_listings.append(listing)
-                        count += 1
-                print(f"     {beds}BR: {count}/{len(hits)} annonces")
-                time.sleep(0.4)
-            except Exception as e:
-                print(f"     {beds}BR: erreur ({e})")
+        hits  = fetch_rentals_for_zone(loc_id, label)
+        count = 0
+        for hit in hits:
+            listing = parse_hit(hit, label)
+            if listing:
+                all_listings.append(listing)
+                count += 1
+        print(f"     ✅ {count} annonces 3-5BR valides")
+        time.sleep(0.5)
 
     n_saved = save_listings(all_listings)
     save_weekly_snapshot()
@@ -336,13 +263,16 @@ async def run_villa_scraping():
         by_zone.setdefault(l.zone, []).append(l)
 
     if by_zone:
-        print(f"\n  📊 Résumé par zone:")
+        print(f"\n  📊 Loyers annuels par zone:")
         for z, lst in sorted(by_zone.items()):
             rents = [l.rent_annual_aed for l in lst]
             print(f"     {z:<18} {len(lst):>3} annonces  "
                   f"moy AED {sum(rents)//len(rents):>9,}/an")
+    else:
+        print("\n  ⚠️  0 annonces — les IDs de zones sont peut-être incorrects")
+        print("  → Le pipeline continuera avec les données existantes")
 
-    print(f"\n  💾 {n_saved}/{len(all_listings)} nouvelles annonces")
+    print(f"\n  💾 {n_saved}/{len(all_listings)} nouvelles annonces sauvegardées")
     return all_listings
 
 
