@@ -92,11 +92,11 @@ async def weekly_pipeline(dry_run: bool = False):
             ],
             "by_beds": [
                 {
-                    "beds":     b["bedrooms"],
+                    "bedrooms": b["bedrooms"],
                     "count":    b["count"],
-                    "avg":      b["avg_rent"],
-                    "min":      b.get("min_rent", 0),
-                    "max":      b.get("max_rent", 0),
+                    "avg_rent": b["avg_rent"],
+                    "min_rent": b.get("min_rent", 0),
+                    "max_rent": b.get("max_rent", 0),
                     "delta":    None,
                     "prev_avg": None,
                 }
